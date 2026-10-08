@@ -306,21 +306,6 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		return err
 	}
 
-	// ---- Incremental graph extraction (fork patch) ----
-	// Skip the LLM call when this exact chunk content was already extracted
-	// with the same extraction config fingerprint (model + custom prompt +
-	// tags + examples). The hash is stored in chunk.Metadata["graph_extract"].
-	if marker := readGraphExtractMarker(chunk.Metadata); marker != nil {
-		fp := graphExtractConfigFingerprint(p.ModelID, extractCfg)
-		if prevFp, _ := marker["fingerprint"].(string); prevFp == fp {
-			if prevHash, _ := marker["content_hash"].(string); prevHash == graphExtractContentHash(chunk.Content) {
-				logger.Infof(ctx,
-					"graph extract: chunk %s unchanged (hash match), skipping LLM extraction", p.ChunkID)
-				graphOut["skipped"] = "graph_hash_unchanged"
-				return nil
-			}
-		}
-	}
 	// Capture chunk content shape on output — lets traces answer "WHAT
 	// did the LLM call see?" without joining back to the chunk store.
 	// Preview is truncated to keep span rows reasonable.
@@ -350,6 +335,22 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		logger.Warnf(ctx, "extract config not enabled")
 		graphOut["skipped"] = "extract_disabled"
 		return nil
+	}
+
+	// ---- Incremental graph extraction (fork patch) ----
+	// Skip the LLM call when this exact chunk content was already extracted
+	// with the same extraction config fingerprint (model + custom prompt +
+	// tags + examples). The hash is stored in chunk.Metadata["graph_extract"].
+	if marker := readGraphExtractMarker(chunk.Metadata); marker != nil {
+		fp := graphExtractConfigFingerprint(p.ModelID, extractCfg)
+		if prevFp, _ := marker["fingerprint"].(string); prevFp == fp {
+			if prevHash, _ := marker["content_hash"].(string); prevHash == graphExtractContentHash(chunk.Content) {
+				logger.Infof(ctx,
+					"graph extract: chunk %s unchanged (hash match), skipping LLM extraction", p.ChunkID)
+				graphOut["skipped"] = "graph_hash_unchanged"
+				return nil
+			}
+		}
 	}
 
 	chatModel, err := s.modelService.GetChatModel(ctx, p.ModelID)
@@ -978,7 +979,7 @@ func (s *DataTableSummaryService) buildSampleDataDescription(ctx context.Context
 func graphExtractConfigFingerprint(modelID string, cfg types.ExtractConfig) string {
 	h := sha256.New()
 	h.Write([]byte(modelID))
-	if cfg != nil {
+	{
 		for _, t := range cfg.Tags {
 			h.Write([]byte(t))
 			h.Write([]byte{0})
