@@ -310,16 +310,14 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	// Skip the LLM call when this exact chunk content was already extracted
 	// with the same extraction config fingerprint (model + custom prompt +
 	// tags + examples). The hash is stored in chunk.Metadata["graph_extract"].
-	if chunk.Metadata != nil {
-		if prev, ok := chunk.Metadata["graph_extract"].(map[string]interface{}); ok {
-			fp := graphExtractConfigFingerprint(p.ModelID, extractCfg)
-			if prevFp, _ := prev["fingerprint"].(string); prevFp == fp {
-				if prevHash, _ := prev["content_hash"].(string); prevHash == graphExtractContentHash(chunk.Content) {
-					logger.Infof(ctx,
-						"graph extract: chunk %s unchanged (hash match), skipping LLM extraction", p.ChunkID)
-					graphOut["skipped"] = "graph_hash_unchanged"
-					return nil
-				}
+	if marker := readGraphExtractMarker(chunk.Metadata); marker != nil {
+		fp := graphExtractConfigFingerprint(p.ModelID, extractCfg)
+		if prevFp, _ := marker["fingerprint"].(string); prevFp == fp {
+			if prevHash, _ := marker["content_hash"].(string); prevHash == graphExtractContentHash(chunk.Content) {
+				logger.Infof(ctx,
+					"graph extract: chunk %s unchanged (hash match), skipping LLM extraction", p.ChunkID)
+				graphOut["skipped"] = "graph_hash_unchanged"
+				return nil
 			}
 		}
 	}
@@ -977,7 +975,7 @@ func (s *DataTableSummaryService) buildSampleDataDescription(ctx context.Context
 // that affects graph extraction output: model id, custom instructions,
 // tags and example text. When any of these change, extraction reruns even
 // for unchanged chunk content.
-func graphExtractConfigFingerprint(modelID string, cfg *types.ExtractConfig) string {
+func graphExtractConfigFingerprint(modelID string, cfg types.ExtractConfig) string {
 	h := sha256.New()
 	h.Write([]byte(modelID))
 	if cfg != nil {
@@ -1010,13 +1008,43 @@ func (s *ChunkExtractService) persistGraphExtractMarker(ctx context.Context, ten
 	if err != nil || fresh == nil {
 		return err
 	}
-	if fresh.Metadata == nil {
-		fresh.Metadata = map[string]interface{}{}
+	md := readGraphExtractMeta(fresh.Metadata)
+	if md == nil {
+		md = map[string]interface{}{}
 	}
-	fresh.Metadata["graph_extract"] = map[string]interface{}{
+	md["graph_extract"] = map[string]interface{}{
 		"fingerprint":  fingerprint,
 		"content_hash": graphExtractContentHash(fresh.Content),
 		"extracted_at": time.Now().UTC().Format(time.RFC3339),
 	}
+	raw, err := json.Marshal(md)
+	if err != nil {
+		return err
+	}
+	fresh.Metadata = types.JSON(raw)
 	return s.chunkRepo.UpdateChunk(ctx, fresh)
+}
+
+// readGraphExtractMeta decodes the chunk Metadata JSON into a map.
+func readGraphExtractMeta(raw types.JSON) map[string]interface{} {
+	if len(raw) == 0 {
+		return nil
+	}
+	var md map[string]interface{}
+	if err := json.Unmarshal(raw, &md); err != nil {
+		return nil
+	}
+	return md
+}
+
+// readGraphExtractMarker returns the stored graph_extract marker map, or nil.
+func readGraphExtractMarker(raw types.JSON) map[string]interface{} {
+	md := readGraphExtractMeta(raw)
+	if md == nil {
+		return nil
+	}
+	if m, ok := md["graph_extract"].(map[string]interface{}); ok {
+		return m
+	}
+	return nil
 }
