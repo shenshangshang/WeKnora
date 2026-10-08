@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -303,6 +305,24 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		handleErr = err
 		return err
 	}
+
+	// ---- Incremental graph extraction (fork patch) ----
+	// Skip the LLM call when this exact chunk content was already extracted
+	// with the same extraction config fingerprint (model + custom prompt +
+	// tags + examples). The hash is stored in chunk.Metadata["graph_extract"].
+	if chunk.Metadata != nil {
+		if prev, ok := chunk.Metadata["graph_extract"].(map[string]interface{}); ok {
+			fp := graphExtractConfigFingerprint(p.ModelID, extractCfg)
+			if prevFp, _ := prev["fingerprint"].(string); prevFp == fp {
+				if prevHash, _ := prev["content_hash"].(string); prevHash == graphExtractContentHash(chunk.Content) {
+					logger.Infof(ctx,
+						"graph extract: chunk %s unchanged (hash match), skipping LLM extraction", p.ChunkID)
+					graphOut["skipped"] = "graph_hash_unchanged"
+					return nil
+				}
+			}
+		}
+	}
 	// Capture chunk content shape on output — lets traces answer "WHAT
 	// did the LLM call see?" without joining back to the chunk store.
 	// Preview is truncated to keep span rows reasonable.
@@ -385,6 +405,13 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		logger.Errorf(ctx, "failed to add graph: %v", err)
 		handleErr = err
 		return err
+	}
+
+	// ---- Incremental graph extraction (fork patch): persist hash ----
+	if err := s.persistGraphExtractMarker(ctx, p.TenantID, p.ChunkID, graphExtractConfigFingerprint(p.ModelID, extractCfg)); err != nil {
+		// Non-fatal: marker persistence failure only loses the skip
+		// optimization for this chunk, never the extraction itself.
+		logger.Warnf(ctx, "graph extract: failed to persist hash marker for %s: %v", p.ChunkID, err)
 	}
 	graphOut["nodes_added"] = len(graph.Node)
 	graphOut["relations_added"] = len(graph.Relation)
@@ -941,4 +968,55 @@ func (s *DataTableSummaryService) buildSampleDataDescription(ctx context.Context
 	}
 
 	return builder.String()
+}
+
+
+// ---- Incremental graph extraction (fork patch) helpers ----
+
+// graphExtractConfigFingerprint builds a stable fingerprint of everything
+// that affects graph extraction output: model id, custom instructions,
+// tags and example text. When any of these change, extraction reruns even
+// for unchanged chunk content.
+func graphExtractConfigFingerprint(modelID string, cfg *types.ExtractConfig) string {
+	h := sha256.New()
+	h.Write([]byte(modelID))
+	if cfg != nil {
+		for _, t := range cfg.Tags {
+			h.Write([]byte(t))
+			h.Write([]byte{0})
+		}
+		h.Write([]byte(cfg.CustomInstructions))
+		h.Write([]byte{0})
+		h.Write([]byte(cfg.Text))
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// graphExtractContentHash hashes chunk content for skip-comparison.
+func graphExtractContentHash(content string) string {
+	h := sha256.New()
+	h.Write([]byte(content))
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// persistGraphExtractMarker writes the extraction marker into the chunk's
+// Metadata JSON so the next run can skip unchanged content. Uses a narrow
+// metadata-only update to avoid clobbering concurrent chunk edits.
+func (s *ChunkExtractService) persistGraphExtractMarker(ctx context.Context, tenantID uint64, chunkID, fingerprint string) error {
+	if s.chunkRepo == nil {
+		return nil
+	}
+	fresh, err := s.chunkRepo.GetChunkByID(ctx, tenantID, chunkID)
+	if err != nil || fresh == nil {
+		return err
+	}
+	if fresh.Metadata == nil {
+		fresh.Metadata = map[string]interface{}{}
+	}
+	fresh.Metadata["graph_extract"] = map[string]interface{}{
+		"fingerprint":  fingerprint,
+		"content_hash": graphExtractContentHash(fresh.Content),
+		"extracted_at": time.Now().UTC().Format(time.RFC3339),
+	}
+	return s.chunkRepo.UpdateChunk(ctx, fresh)
 }
